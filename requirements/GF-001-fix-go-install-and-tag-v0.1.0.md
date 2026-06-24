@@ -17,7 +17,7 @@ main.go:7:2: "syscall" imported and not used
 main.go:90:6: use of package syscall not in selector
 ```
 
-Two root causes:
+Three root causes:
 
 1. **Unused `syscall` import.** During the initial commit (`c88b3cc`), `main.go`
    imported `syscall` but never used it in a selector expression. The Go compiler
@@ -30,24 +30,30 @@ Two root causes:
    (`97bcdee`), the proxy continued serving the cached broken version because
    there was no explicit version tag to supersede it.
 
+3. **Non-ASCII filename.** The initial ticket file used an em dash (`—`) in the
+   filename. Go's module zip format rejects non-ASCII characters in file paths,
+   which broke `go install` even after the code was fixed. The file was renamed
+   to use ASCII-only characters. Tag `v0.1.0` was already cached by the proxy
+   with the broken filename, so `v0.1.1` was created as the first installable
+   release.
+
 ## Fix
 
-1. Removed the unused `syscall` import (done in commit `97bcdee`).
-2. Created version tag `v0.1.0` on the fixed commit and pushed it to origin.
-   This gives the Go module proxy an explicit version to resolve, bypassing
-   the stale pseudo-version cache.
+1. Removed the unused `syscall` import (commit `97bcdee`).
+2. Renamed ticket file to ASCII-safe path (commit `8a1ad06`).
+3. Created version tag `v0.1.1` on the fixed commit and pushed it to origin.
 
 ## Verification
 
 After the fix, installation works:
 
 ```bash
-go install github.com/shahriarhossain/gitfence@v0.1.0
+go install github.com/shahriarhossain/gitfence@v0.1.1
 gitfence status    # passes through to git — read-only, works
 gitfence push      # blocked — mutating command
 ```
 
-## What ships in v0.1.0
+## What ships in v0.1.1
 
 - Standalone git proxy binary (Fold 1 of TSF 252)
 - Read-only allowlist: status, diff, log, show, branch --list, ls-files,
