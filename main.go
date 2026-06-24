@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"syscall"
 
 	"github.com/shahriarhossain/gitfence/internal/parser"
 )
@@ -87,6 +86,5 @@ func realPath(p string) (string, error) {
 	if err != nil {
 		return p, nil
 	}
-	_ = syscall
 	return resolved, nil
 }
