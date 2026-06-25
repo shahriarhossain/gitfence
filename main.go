@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/shahriarhossain/gitfence/internal/config"
+	"github.com/shahriarhossain/gitfence/internal/gateway"
 	"github.com/shahriarhossain/gitfence/internal/parser"
 	"github.com/shahriarhossain/gitfence/internal/setup"
 )
@@ -15,6 +17,15 @@ var gitfenceSubcommands = map[string]bool{
 	"init":       true,
 	"deactivate": true,
 	"version":    true,
+	"check":      true,
+}
+
+// Commands that are gitfence-only (no git equivalent), so they work
+// even when invoked as "git check <id>" via the wrapper.
+var gitfenceExclusiveSubcommands = map[string]bool{
+	"check":      true,
+	"version":    true,
+	"deactivate": true,
 }
 
 func main() {
@@ -37,7 +48,7 @@ func main() {
 		return
 	}
 
-	if gitfenceSubcommands[args[0]] && !isInvokedAsGit() {
+	if gitfenceSubcommands[args[0]] && (!isInvokedAsGit() || gitfenceExclusiveSubcommands[args[0]]) {
 		runGitfenceCommand(args[0], args[1:])
 		return
 	}
@@ -45,14 +56,13 @@ func main() {
 	cmd := parser.Parse(args)
 
 	if cmd.IsMutating {
-		fmt.Fprintf(os.Stderr, "gitfence: blocked '%s'\n\n", cmd.Subcommand)
-		fmt.Fprintln(os.Stderr, "  Mutating git commands are not permitted in this environment.")
-		fmt.Fprintln(os.Stderr, "  Allowed commands: status, diff, log, show, branch --list, ls-files,")
-		fmt.Fprintln(os.Stderr, "                    config --get, remote -v, blame, shortlog, rev-parse")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "  To allow governed writes, connect gitfence to a policy gateway.")
-		fmt.Fprintln(os.Stderr, "  Run: gitfence init --help")
-		os.Exit(1)
+		cfg := config.Load()
+		if cfg.HasGateway() {
+			handleGatewayEvaluation(cfg, cmd, args)
+		} else {
+			blockLocally(cmd)
+		}
+		return
 	}
 
 	passThroughToGit(args)
@@ -73,6 +83,41 @@ func runGitfenceCommand(subcmd string, args []string) {
 		setup.Deactivate(args)
 	case "version":
 		fmt.Println("gitfence v0.1.1")
+	case "check":
+		checkApproval(args)
+	}
+}
+
+func checkApproval(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: gitfence check <approval-id>")
+		os.Exit(1)
+	}
+	cfg := config.Load()
+	if !cfg.HasGateway() {
+		fmt.Fprintln(os.Stderr, "gitfence: no gateway configured. Run: gitfence init --gateway=...")
+		os.Exit(1)
+	}
+	status, err := gateway.CheckApproval(cfg, args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gitfence: %v\n", err)
+		os.Exit(1)
+	}
+	switch status.Status {
+	case "APPROVED":
+		fmt.Printf("gitfence: approval %s — APPROVED\n", args[0])
+		fmt.Println("  You can now re-run your command.")
+	case "PENDING":
+		fmt.Printf("gitfence: approval %s — still waiting for human review\n", args[0])
+	case "DENIED":
+		fmt.Printf("gitfence: approval %s — DENIED\n", args[0])
+		if status.Message != "" {
+			fmt.Printf("  %s\n", status.Message)
+		}
+	case "TIMED_OUT":
+		fmt.Printf("gitfence: approval %s — timed out (no reviewer responded)\n", args[0])
+	default:
+		fmt.Printf("gitfence: approval %s — %s\n", args[0], status.Status)
 	}
 }
 
@@ -83,10 +128,71 @@ func printUsage() {
 	fmt.Println("  gitfence init              Activate gitfence as the git binary")
 	fmt.Println("  gitfence init --symlink    Symlink gitfence as git (for containers)")
 	fmt.Println("  gitfence deactivate        Remove gitfence wrapper and restore git")
+	fmt.Println("  gitfence check <id>        Check approval status of a HITL request")
 	fmt.Println("  gitfence version           Print version")
 	fmt.Println("")
 	fmt.Println("Once activated, use git normally — gitfence intercepts transparently.")
 	fmt.Println("Read-only commands pass through. Mutating commands are blocked.")
+}
+
+func blockLocally(cmd parser.Command) {
+	fmt.Fprintf(os.Stderr, "gitfence: blocked '%s'\n\n", cmd.Subcommand)
+	fmt.Fprintln(os.Stderr, "  Mutating git commands are not permitted in this environment.")
+	fmt.Fprintln(os.Stderr, "  Allowed commands: status, diff, log, show, branch --list, ls-files,")
+	fmt.Fprintln(os.Stderr, "                    config --get, remote -v, blame, shortlog, rev-parse")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "  To allow governed writes, connect gitfence to a policy gateway.")
+	fmt.Fprintln(os.Stderr, "  Run: gitfence init --help")
+	os.Exit(1)
+}
+
+func handleGatewayEvaluation(cfg *config.Config, cmd parser.Command, args []string) {
+	resp, err := gateway.Evaluate(cfg, cmd, args)
+	if err != nil {
+		if cfg.OfflineMode == "fail-open" {
+			fmt.Fprintf(os.Stderr, "gitfence: gateway unreachable, fail-open active — executing locally\n")
+			passThroughToGit(args)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "gitfence: gateway error — %v\n\n", err)
+		fmt.Fprintln(os.Stderr, "  Mutating commands are blocked when the gateway is unreachable (fail-closed mode).")
+		fmt.Fprintln(os.Stderr, "  Check your gateway URL or set offline_mode = \"fail-open\" in config.")
+		os.Exit(1)
+	}
+
+	switch resp.Decision {
+	case "ALLOW":
+		if resp.Message != "" {
+			fmt.Fprintf(os.Stderr, "gitfence: %s\n", resp.Message)
+		}
+		passThroughToGit(args)
+
+	case "BLOCK":
+		fmt.Fprintf(os.Stderr, "gitfence: blocked '%s'\n\n", cmd.Subcommand)
+		if resp.Message != "" {
+			fmt.Fprintf(os.Stderr, "  %s\n", resp.Message)
+		}
+		if resp.Remediation != "" {
+			fmt.Fprintf(os.Stderr, "  %s\n", resp.Remediation)
+		}
+		os.Exit(1)
+
+	case "PENDING_APPROVAL":
+		fmt.Fprintf(os.Stderr, "gitfence: '%s' requires human approval\n\n", cmd.Subcommand)
+		if resp.Message != "" {
+			fmt.Fprintf(os.Stderr, "  %s\n", resp.Message)
+		}
+		if resp.ApprovalID != "" {
+			fmt.Fprintf(os.Stderr, "\n  Approval ID: %s\n", resp.ApprovalID)
+			fmt.Fprintf(os.Stderr, "  Check status: gitfence check %s\n", resp.ApprovalID)
+			fmt.Fprintln(os.Stderr, "  Once approved, re-run your command.")
+		}
+		os.Exit(2)
+
+	default:
+		fmt.Fprintf(os.Stderr, "gitfence: unexpected gateway decision '%s'\n", resp.Decision)
+		os.Exit(1)
+	}
 }
 
 func passThroughToGit(args []string) {

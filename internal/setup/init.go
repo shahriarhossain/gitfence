@@ -7,11 +7,16 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/shahriarhossain/gitfence/internal/config"
 )
 
 func Init(args []string) {
 	symlink := false
 	targetDir := ""
+	gatewayURL := ""
+	agentID := ""
+	token := ""
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -25,12 +30,42 @@ func Init(args []string) {
 				fmt.Fprintln(os.Stderr, "gitfence init: --target requires a directory argument")
 				os.Exit(1)
 			}
+		case "--gateway":
+			if i+1 < len(args) {
+				i++
+				gatewayURL = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "gitfence init: --gateway requires a URL argument")
+				os.Exit(1)
+			}
+		case "--agent-id":
+			if i+1 < len(args) {
+				i++
+				agentID = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "gitfence init: --agent-id requires an argument")
+				os.Exit(1)
+			}
+		case "--token":
+			if i+1 < len(args) {
+				i++
+				token = args[i]
+			} else {
+				fmt.Fprintln(os.Stderr, "gitfence init: --token requires an argument")
+				os.Exit(1)
+			}
 		case "--help", "-h":
 			printInitHelp()
 			return
 		default:
 			if strings.HasPrefix(args[i], "--target=") {
 				targetDir = strings.TrimPrefix(args[i], "--target=")
+			} else if strings.HasPrefix(args[i], "--gateway=") {
+				gatewayURL = strings.TrimPrefix(args[i], "--gateway=")
+			} else if strings.HasPrefix(args[i], "--agent-id=") {
+				agentID = strings.TrimPrefix(args[i], "--agent-id=")
+			} else if strings.HasPrefix(args[i], "--token=") {
+				token = strings.TrimPrefix(args[i], "--token=")
 			} else {
 				fmt.Fprintf(os.Stderr, "gitfence init: unknown flag '%s'\n", args[i])
 				os.Exit(1)
@@ -38,11 +73,43 @@ func Init(args []string) {
 		}
 	}
 
+	if gatewayURL != "" {
+		saveGatewayConfig(gatewayURL, agentID, token)
+	}
+
 	if symlink {
 		initSymlink(targetDir)
 	} else {
 		initWrapper()
 	}
+}
+
+func saveGatewayConfig(gatewayURL, agentID, token string) {
+	if agentID == "" || token == "" {
+		fmt.Fprintln(os.Stderr, "gitfence init: --gateway requires --agent-id and --token")
+		fmt.Fprintln(os.Stderr, "")
+		fmt.Fprintln(os.Stderr, "  Example:")
+		fmt.Fprintln(os.Stderr, "    gitfence init --gateway=http://localhost:8080 --agent-id=gittest-1 --token=abc123")
+		os.Exit(1)
+	}
+
+	cfg := &config.Config{
+		GatewayURL:  gatewayURL,
+		AgentID:     agentID,
+		Token:       token,
+		OfflineMode: "fail-closed",
+	}
+
+	if err := config.Save(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "gitfence init: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("gitfence: gateway configured\n")
+	fmt.Printf("  gateway:  %s\n", gatewayURL)
+	fmt.Printf("  agent-id: %s\n", agentID)
+	fmt.Printf("  config:   %s\n", config.ConfigPath())
+	fmt.Println("")
 }
 
 func initSymlink(targetDir string) {
@@ -218,19 +285,25 @@ func printInitHelp() {
 	fmt.Println("Activate gitfence as the git binary in this environment.")
 	fmt.Println("")
 	fmt.Println("Flags:")
+	fmt.Println("  --gateway=<url>    Policy gateway URL for command evaluation")
+	fmt.Println("  --agent-id=<id>    Agent identifier registered in the policy gateway")
+	fmt.Println("  --token=<token>    Authentication token for the gateway")
 	fmt.Println("  --symlink          Create a symlink instead of a wrapper script")
 	fmt.Println("                     (designed for Docker containers)")
 	fmt.Println("  --target=<dir>     Directory for the symlink (default: /usr/local/bin)")
 	fmt.Println("                     Only valid with --symlink")
 	fmt.Println("  --help, -h         Show this help")
 	fmt.Println("")
-	fmt.Println("Default mode creates a wrapper script at ~/.gitfence/bin/git")
-	fmt.Println("and instructs you to prepend that directory to your PATH.")
+	fmt.Println("Without --gateway, gitfence blocks all mutating commands (free tier).")
+	fmt.Println("With --gateway, mutating commands are forwarded to the policy gateway")
+	fmt.Println("for policy evaluation (ALLOW / BLOCK / HITL).")
 	fmt.Println("")
 	fmt.Println("Examples:")
-	fmt.Println("  gitfence init                           # wrapper mode (recommended)")
+	fmt.Println("  gitfence init                           # standalone read-only mode")
+	fmt.Println("  gitfence init --gateway=http://localhost:8080 \\")
+	fmt.Println("                --agent-id=gittest-1 \\")
+	fmt.Println("                --token=abc123             # gateway-connected mode")
 	fmt.Println("  gitfence init --symlink                 # container mode")
-	fmt.Println("  gitfence init --symlink --target=/bin   # custom symlink path")
 }
 
 func gitfenceBinDir() string {

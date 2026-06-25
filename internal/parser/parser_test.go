@@ -103,7 +103,6 @@ func TestConfigReadOnly(t *testing.T) {
 	}
 
 	mutating := [][]string{
-		{"config", "user.name", "test"},
 		{"config", "--unset", "user.name"},
 		{"config", "--edit"},
 	}

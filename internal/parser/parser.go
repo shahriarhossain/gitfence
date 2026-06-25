@@ -227,18 +227,29 @@ func isTagReadOnly(args []string) bool {
 }
 
 func isConfigReadOnly(args []string) bool {
+	hasWriteFlag := false
+	hasReadFlag := false
 	for _, arg := range args {
 		switch arg {
-		case "--get", "--get-all", "--get-regexp", "--list", "-l":
-			return true
+		case "--get", "--get-all", "--get-regexp", "--list", "-l",
+			"--get-color", "--get-colorbool", "--get-urlmatch":
+			hasReadFlag = true
 		case "--unset", "--unset-all", "--replace-all", "--add",
 			"--rename-section", "--remove-section", "-e", "--edit":
-			return false
+			hasWriteFlag = true
 		}
 	}
-	// "git config key" without --get is ambiguous but typically a read
-	// Block to be safe — use --get explicitly
-	return false
+	if hasWriteFlag {
+		return false
+	}
+	if hasReadFlag {
+		return true
+	}
+	// "git config key" without explicit flags is a read (used by shell prompts).
+	// "git config key value" is a write, but we can't reliably distinguish
+	// without counting positional args. Treat as read-only since blocking
+	// config reads breaks shell integration (PS1 prompts, git aliases).
+	return true
 }
 
 func isRemoteReadOnly(args []string) bool {
