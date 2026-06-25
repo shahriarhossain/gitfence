@@ -4,9 +4,18 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 
 	"github.com/shahriarhossain/gitfence/internal/parser"
+	"github.com/shahriarhossain/gitfence/internal/setup"
 )
+
+var gitfenceSubcommands = map[string]bool{
+	"init":       true,
+	"deactivate": true,
+	"version":    true,
+}
 
 func main() {
 	if os.Getenv("GITFENCE_BYPASS") == "true" {
@@ -16,8 +25,20 @@ func main() {
 	}
 
 	args := os.Args[1:]
+
 	if len(args) == 0 {
-		passThroughToGit(args)
+		// If invoked as "git" (via wrapper), pass through to real git.
+		// If invoked as "gitfence", show usage.
+		if isInvokedAsGit() {
+			passThroughToGit(args)
+		} else {
+			printUsage()
+		}
+		return
+	}
+
+	if gitfenceSubcommands[args[0]] && !isInvokedAsGit() {
+		runGitfenceCommand(args[0], args[1:])
 		return
 	}
 
@@ -35,6 +56,37 @@ func main() {
 	}
 
 	passThroughToGit(args)
+}
+
+func isInvokedAsGit() bool {
+	exe := filepath.Base(os.Args[0])
+	exe = strings.TrimSuffix(exe, ".exe")
+	exe = strings.TrimSuffix(exe, ".cmd")
+	return exe == "git"
+}
+
+func runGitfenceCommand(subcmd string, args []string) {
+	switch subcmd {
+	case "init":
+		setup.Init(args)
+	case "deactivate":
+		setup.Deactivate(args)
+	case "version":
+		fmt.Println("gitfence v0.1.1")
+	}
+}
+
+func printUsage() {
+	fmt.Println("gitfence — a drop-in git wrapper that blocks mutating commands")
+	fmt.Println("")
+	fmt.Println("Usage:")
+	fmt.Println("  gitfence init              Activate gitfence as the git binary")
+	fmt.Println("  gitfence init --symlink    Symlink gitfence as git (for containers)")
+	fmt.Println("  gitfence deactivate        Remove gitfence wrapper and restore git")
+	fmt.Println("  gitfence version           Print version")
+	fmt.Println("")
+	fmt.Println("Once activated, use git normally — gitfence intercepts transparently.")
+	fmt.Println("Read-only commands pass through. Mutating commands are blocked.")
 }
 
 func passThroughToGit(args []string) {
@@ -82,7 +134,7 @@ func realPath(p string) (string, error) {
 	if p == "" {
 		return "", nil
 	}
-	resolved, err := os.Readlink(p)
+	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
 		return p, nil
 	}
