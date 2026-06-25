@@ -38,7 +38,12 @@ before execution and applies a strict allowlist. Read-only commands
 pass through to native git. Mutating commands are blocked with a clear
 error message that tells the agent what happened and what to do instead.
 
-## How it works
+## Two modes
+
+### Standalone mode (zero config)
+
+Block all mutating commands. No network calls, no external dependencies.
+Install and it works.
 
 ```
 Agent runs `git push origin main`
@@ -49,20 +54,37 @@ Agent runs `git push origin main`
         |-- Read-only command?  -->  Pass through to native git (zero overhead)
         |
         |-- Mutating command?   -->  Block + return structured error
-                                     {
-                                       "error": "gitfence: blocked",
-                                       "command": "push",
-                                       "reason": "Mutating git commands are not permitted in this environment.",
-                                       "suggestion": "Use read-only commands (status, diff, log) or request write access through your organization's governance policy."
-                                     }
 ```
 
-No network calls, no external dependencies, no configuration required
-for the default mode. Install and it works.
+### Governed mode (with a policy gateway)
+
+Connect gitfence to a policy gateway for granular control — allow
+pushes to feature branches, block pushes to main, route force-pushes
+to human approval. The gateway evaluates policy; gitfence executes
+the decision.
+
+```
+Agent runs `git push origin main`
+        |
+        v
+ [gitfence parser]
+        |
+        |-- Read-only?   -->  Pass through locally (no gateway call)
+        |
+        |-- Mutating?    -->  POST /git/evaluate to gateway
+                |
+                |-- ALLOW            -->  Execute via native git
+                |-- BLOCK            -->  Return error to agent
+                |-- PENDING_APPROVAL -->  Wait for human approval, then execute
+```
+
+gitfence is **gateway-agnostic**. It works with any HTTP service that
+implements two endpoints. See [Gateway Contract](#gateway-contract)
+for the full specification.
 
 ## Installation
 
-### From source (Go)
+### From source (Go 1.22+)
 
 ```bash
 go install github.com/shahriarhossain/gitfence@latest
@@ -82,43 +104,239 @@ place it in your PATH, and make it executable.
 
 ## Setup
 
-### Activate for the current environment
+### Standalone mode (block all mutations)
 
 ```bash
 gitfence init
 ```
 
-This creates a shell alias so `git` resolves to `gitfence` in the
-current environment. The agent (or anyone in that session) now runs
-all git commands through gitfence transparently.
+This creates a shell wrapper so `git` resolves to `gitfence`. The
+agent runs all git commands through gitfence transparently. All
+mutating commands are blocked.
 
-### Activate for a Docker container / agent sandbox
+### Governed mode (with a policy gateway)
+
+```bash
+gitfence init \
+  --gateway=https://your-gateway.example.com \
+  --agent-id=oncall-bot \
+  --token=your-auth-token
+```
+
+Mutating commands are forwarded to the gateway for policy evaluation.
+The gateway decides: ALLOW, BLOCK, or PENDING_APPROVAL.
+
+### Docker / container setup
 
 ```dockerfile
-# Install gitfence as the git binary inside the container
 COPY --from=shahriarhossain/gitfence:latest /usr/local/bin/gitfence /usr/local/bin/gitfence
-RUN ln -sf /usr/local/bin/gitfence /usr/local/bin/git
+RUN gitfence init --symlink
 ```
 
 ### Verify installation
 
 ```bash
-git status       # works normally — read-only, passes through
-git push         # blocked — mutating command
+which git                # should point to ~/.gitfence/bin/git
+git status               # works normally — read-only, passes through
+git push                 # blocked (standalone) or gateway-evaluated (governed)
 ```
 
-Expected output for the blocked command:
+## Gateway Contract
+
+gitfence talks to **any** HTTP service that implements these two
+endpoints. There is no vendor lock-in — build your own gateway, use
+an existing one, or run without one entirely.
+
+### Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/git/evaluate` | Evaluate a mutating command against policy |
+| `GET` | `/git/approval/{id}` | Poll the status of a pending approval |
+
+### `POST /git/evaluate`
+
+Called before every mutating command. The gateway evaluates policy
+and returns a decision.
+
+**Request:**
+
+```json
+{
+  "agent_id": "oncall-bot",
+  "command": "push",
+  "arguments": {
+    "command": "push",
+    "remote": "origin",
+    "branch": "main",
+    "force": "true"
+  },
+  "token": "auth-token",
+  "context": {
+    "head_sha": "abc123def456",
+    "commit_message": "Fix: handle null case in parser",
+    "commit_author": "oncall-bot <bot@company.com>",
+    "diff_stat": "3 files changed, 42 insertions(+), 15 deletions(-)",
+    "files_changed": ["src/parser.go", "internal/handler.go", "main.go"],
+    "remote_url": "https://github.com/acme/repo.git"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `agent_id` | string | yes | Identifier for the agent making the request |
+| `command` | string | yes | Git subcommand (`push`, `commit`, `reset`, etc.) |
+| `arguments` | object | yes | Parsed command arguments (see below) |
+| `token` | string | yes | Authentication token for the gateway |
+| `context` | object | no | Repository state at the time of the request |
+
+**Arguments by command:**
+
+| Command | Fields sent |
+|---------|-------------|
+| `push` | `command`, `remote`, `branch`, `force` |
+| `commit` | `command`, `message` |
+| `checkout` / `switch` | `command`, `branch` |
+| `merge` / `rebase` | `command`, `branch` |
+| `branch` (create/delete) | `command`, `branch` |
+| Other mutating commands | `command`, `target` (last positional arg) |
+
+When `git push` is run without explicit arguments, gitfence resolves
+the current branch and tracking remote automatically.
+
+**Context fields** (all optional, best-effort):
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `head_sha` | `git rev-parse HEAD` | Current commit SHA |
+| `commit_message` | `git log -1 --format=%s` | Latest commit message |
+| `commit_author` | `git log -1 --format=%an <%ae>` | Latest commit author |
+| `diff_stat` | `git diff --stat HEAD~1` | Diff statistics |
+| `files_changed` | `git diff --name-only HEAD~1` | List of changed files |
+| `remote_url` | `git remote get-url origin` | Remote repository URL |
+
+**Response:**
+
+```json
+{
+  "decision": "BLOCK",
+  "message": "Push to 'main' blocked by branch protection policy.",
+  "remediation": "Push to a feature branch (e.g. agent/fix-123) and open a pull request.",
+  "policy_id": "branch-protection-001",
+  "approval_id": ""
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decision` | string | `ALLOW`, `BLOCK`, or `PENDING_APPROVAL` |
+| `message` | string | Human-readable explanation of the decision |
+| `remediation` | string | Suggested alternative action (for BLOCK) |
+| `policy_id` | string | ID of the policy rule that matched |
+| `approval_id` | string | Approval request ID (for PENDING_APPROVAL) |
+
+**Decision behavior:**
+
+| Decision | What gitfence does |
+|----------|--------------------|
+| `ALLOW` | Execute the command via native git |
+| `BLOCK` | Print the message and remediation, exit code 1 |
+| `PENDING_APPROVAL` | Enter wait mode (poll for approval), or exit with approval ID |
+
+### `GET /git/approval/{id}`
+
+Called by gitfence to poll the status of a pending approval request.
+
+**Response:**
+
+```json
+{
+  "status": "APPROVED",
+  "approval_id": "ap_xxxxxxxxxxxx",
+  "agent_id": "oncall-bot",
+  "tool_id": "github",
+  "method": "git_force_push",
+  "message": "",
+  "context": {
+    "head_sha": "abc123def456"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | string | `PENDING`, `APPROVED`, `DENIED`, or `TIMED_OUT` |
+| `approval_id` | string | The approval request ID |
+| `context` | object | The stored context from the original request |
+
+**Status behavior:**
+
+| Status | What gitfence does |
+|--------|--------------------|
+| `PENDING` | Keep polling |
+| `APPROVED` | Verify HEAD SHA matches, then execute the command |
+| `DENIED` | Print denial message, exit code 1 |
+| `TIMED_OUT` | Print timeout message, exit code 1 |
+
+### State integrity
+
+When gitfence receives `APPROVED`, it checks whether the repository
+state has changed since the approval was requested:
+
+1. Compares the current `HEAD` SHA against the `head_sha` from the
+   original request context.
+2. If they match, the command executes.
+3. If they differ, the command is blocked with a message explaining
+   that the approval was for a different repo state.
+
+This prevents a class of vulnerability where an approval for one set
+of changes is used to push a different set of changes.
+
+### Implementing your own gateway
+
+A minimal gateway needs to:
+
+1. Accept `POST /git/evaluate` and return a JSON response with a
+   `decision` field (`ALLOW`, `BLOCK`, or `PENDING_APPROVAL`).
+2. If using HITL approvals, implement `GET /git/approval/{id}` to
+   return the status of pending requests.
+3. Store the `context` from evaluate requests so it can be returned
+   via the approval endpoint (needed for state integrity checks).
+
+A gateway that always allows push to feature branches and blocks
+push to main can be implemented in ~50 lines of code. No specific
+framework or language is required — gitfence communicates over
+plain HTTP/JSON.
+
+## Wait Mode
+
+When a command is routed to human approval (`PENDING_APPROVAL`),
+gitfence stays alive and polls the gateway until the request is
+resolved:
 
 ```
-gitfence: blocked 'push'
+gitfence: 'push' requires human approval
 
-  Mutating git commands are not permitted in this environment.
-  Allowed commands: status, diff, log, show, branch --list, ls-files,
-                    config --get, remote -v, blame, shortlog, rev-parse
+  Force-push rewrites remote history and can destroy other
+  contributors' work. Human approval required.
 
-  To allow governed writes, connect gitfence to a policy gateway.
-  Run: gitfence init --help
+  Approval ID: ap_xxxxxxxxxxxx
+  Waiting for approval... (Ctrl+C to exit)
+
+  ... [polling every 10s] ...
+
+  Approved — executing command
+  [git output follows]
 ```
+
+- **Ctrl+C** exits cleanly and prints the approval ID for later
+  use with `gitfence check <id>`.
+- **Auto mode** (default): wait mode is on in interactive terminals,
+  off in CI/scripts. Configurable via `wait_mode` in config.
+- **State integrity**: before executing, gitfence verifies `HEAD`
+  hasn't changed since the approval request (see
+  [State integrity](#state-integrity)).
 
 ## Supported commands
 
@@ -148,7 +366,7 @@ gitfence: blocked 'push'
 | `git worktree` | `list` | List worktrees (add/remove blocked) |
 | `git notes` | `list`, `show` | View notes (add/remove blocked) |
 
-### Blocked (mutating) — returns structured error
+### Blocked (mutating) — requires gateway or blocked outright
 
 | Command | What it does | Why it's blocked |
 |---------|-------------|-----------------|
@@ -156,7 +374,6 @@ gitfence: blocked 'push'
 | `git push --force` | Force-push to remote | Rewrites remote history, destroys others' work |
 | `git commit` | Create a commit | Captures a snapshot of changes in history |
 | `git reset` | Reset current HEAD | `--hard` discards uncommitted work permanently |
-| `git reset --hard` | Hard reset | Destroys working tree changes irreversibly |
 | `git checkout` | Switch branches / restore files | Can overwrite uncommitted changes |
 | `git switch` | Switch branches | Can overwrite uncommitted changes |
 | `git restore` | Restore working tree files | Discards uncommitted modifications |
@@ -170,49 +387,44 @@ gitfence: blocked 'push'
 | `git stash push/pop/drop` | Modify stash | Can lose stashed work |
 | `git tag -d / -a` | Create/delete tags | Modifies tag references |
 | `git branch -d / -D / -m` | Delete/rename branches | Destroys branch references |
-| `git fetch` | Fetch from remote | Allowed by default, blocked only with refspecs that write |
 | `git pull` | Fetch + merge | Merge component modifies local branch |
-| `git submodule update` | Update submodules | Modifies working tree |
 | `git config --set/--unset` | Write git configuration | Modifies repository config |
 | `git remote add/remove/rename` | Modify remotes | Changes remote configuration |
-| `git reflog expire/delete` | Modify reflog | Destroys recovery data |
-| `git notes add/remove` | Modify notes | Changes commit metadata |
-| `git worktree add/remove` | Modify worktrees | Creates/destroys working directories |
-
-### Side-by-side: what changes for the agent
-
-| What the agent wants to do | Without gitfence | With gitfence |
-|---|---|---|
-| Check repo status | `git status` | `git status` (unchanged) |
-| View recent commits | `git log --oneline -10` | `git log --oneline -10` (unchanged) |
-| See what changed | `git diff HEAD~1` | `git diff HEAD~1` (unchanged) |
-| View branch list | `git branch -a` | `git branch -a` (unchanged) |
-| Check file blame | `git blame src/main.py` | `git blame src/main.py` (unchanged) |
-| Push to main | `git push origin main` | Blocked: "Mutating command not permitted" |
-| Force-push | `git push --force` | Blocked: "Mutating command not permitted" |
-| Hard reset | `git reset --hard HEAD~3` | Blocked: "Mutating command not permitted" |
-| Delete a branch | `git branch -D feature/old` | Blocked: "Mutating command not permitted" |
-| Rewrite history | `git rebase -i HEAD~5` | Blocked: "Mutating command not permitted" |
-| Clean untracked files | `git clean -fd` | Blocked: "Mutating command not permitted" |
 
 ## Configuration
 
-gitfence works with zero configuration. For advanced use cases, create
-`~/.config/gitfence/config.toml`:
+gitfence works with zero configuration in standalone mode. For
+governed mode, create `~/.config/gitfence/gitfence.toml`:
 
 ```toml
-# Path to the real git binary (auto-detected if not set)
-git_path = "/usr/bin/git"
+# Policy gateway connection
+gateway_url = "https://your-gateway.example.com"
+agent_id = "oncall-bot"
+token = "your-auth-token"
 
-# What to do when a mutating command is blocked
-# "error" (default) — print structured error to stderr, exit 1
-# "json"            — print JSON error to stdout (for agent tool parsing)
-output_format = "error"
+# What happens when the gateway is unreachable
+# "fail-closed" (default) — block all mutating commands
+# "fail-open"             — allow and log locally (risky)
+offline_mode = "fail-closed"
 
-# Additional read-only commands to allow (beyond the default set)
-# Use this for custom aliases or plumbing commands
-extra_allow = ["git-lfs ls-files"]
+# Wait mode for HITL approvals
+# "auto" (default) — wait in interactive terminals, exit in CI
+# "on"              — always wait
+# "off"             — never wait (print approval ID and exit)
+wait_mode = "auto"
+
+# Seconds between approval status polls (default 10)
+wait_poll_seconds = 10
 ```
+
+| Key | Values | Default |
+|-----|--------|---------|
+| `gateway_url` | URL of the policy gateway | (none — standalone mode) |
+| `agent_id` | Agent identifier | (none) |
+| `token` | Gateway auth token | (none) |
+| `offline_mode` | `fail-closed` / `fail-open` | `fail-closed` |
+| `wait_mode` | `auto` / `on` / `off` | `auto` |
+| `wait_poll_seconds` | Poll interval in seconds | `10` |
 
 ## Developer Mode (passthrough bypass)
 
@@ -232,88 +444,55 @@ don't forget it's on:
 gitfence: bypass active (GITFENCE_BYPASS=true) — all commands pass through to git
 ```
 
-To disable bypass, unset the variable:
-
-```bash
-unset GITFENCE_BYPASS
-```
-
-### How the bypass works internally
-
-```go
-package main
-
-import (
-    "fmt"
-    "os"
-    "os/exec"
-)
-
-func main() {
-    if os.Getenv("GITFENCE_BYPASS") == "true" {
-        fmt.Fprintln(os.Stderr, "gitfence: bypass active (GITFENCE_BYPASS=true) — all commands pass through to git")
-        passThroughToRealGit(os.Args[1:])
-        return
-    }
-
-    // Standard gitfence blocking logic...
-}
-```
-
-### When to use bypass
-
 | Scenario | Use bypass? |
 |---|---|
 | You're developing locally and need to push your own code | Yes |
 | The governance gateway is not yet running | Yes |
-| You're testing gitfence itself and need to verify blocking | No — leave bypass off |
-| Agent sandbox / container / CI runner | Never — don't set the variable |
-
-### Security note
+| You're testing gitfence itself and need to verify blocking | No |
+| Agent sandbox / container / CI runner | Never |
 
 The bypass is controlled by the **environment**, not by the agent. In a
 properly configured agent sandbox or container, the agent should not
 have permission to set environment variables that affect the parent
-shell. The bypass is designed for human developers who control their own
-terminal session — not for agents.
-
-For defense-in-depth:
-- Don't set `GITFENCE_BYPASS` in the agent's container image or
-  environment config.
-- If you use Docker, the variable is absent by default — gitfence
-  enforces fully.
-- Pair with server-side branch protection as a second layer.
+shell. For defense-in-depth, pair gitfence with server-side branch
+protection.
 
 ## FAQ
 
 **Can an agent bypass gitfence?**
 If gitfence is installed as the `git` binary (via symlink or PATH
 override), the agent cannot bypass it without access to the real git
-binary path. The `GITFENCE_BYPASS` env var exists for human developers
-(see Developer Mode above), but in a container environment where the
-variable is not set and the real git binary is removed or renamed, there
-is no bypass path. For defense-in-depth, pair gitfence with server-side
-branch protection rules.
+binary path. In a container where the real git binary is removed or
+renamed, there is no bypass path.
 
 **Does gitfence add latency?**
-For read-only commands: effectively zero — it parses the command
-arguments (microseconds) and passes through to native git. For blocked
-commands: the command never executes, so it's faster than letting it
-fail on the server side.
+For read-only commands: effectively zero — argument parsing takes
+microseconds. For governed mutating commands: one HTTP round-trip to
+the gateway (typically <50ms on localhost, <200ms remote). For blocked
+commands: the command never executes.
+
+**Does gitfence depend on any specific gateway or platform?**
+No. gitfence communicates over plain HTTP/JSON with two endpoints
+(`POST /git/evaluate` and `GET /git/approval/{id}`). Any service
+that implements the [Gateway Contract](#gateway-contract) works.
+Without a gateway, gitfence operates in standalone mode and blocks
+all mutations. If you're looking for a gateway that handles this
+along with full AI governance (policy engine, audit ledger, HITL
+approval queue, cost controls), check out
+[Froda AI](https://www.froda.ai) — a runtime AI governance platform.
 
 **What about `git add` and `git commit`?**
-Both are blocked by default. `git add` stages changes (modifies the
-index) and `git commit` creates a snapshot in history. If your workflow
-requires agents to commit locally (but not push), see the governed
-mode documentation.
+Both are classified as mutating. In standalone mode, they're blocked.
+In governed mode, the gateway decides — most policies allow them since
+they only affect the local repo.
 
 **What about git aliases?**
 gitfence resolves aliases before evaluation. If `git co` is aliased to
 `git checkout`, the checkout rules apply.
 
 **What about git hooks?**
-gitfence operates before git hooks. If a command is blocked by gitfence,
-no git hooks execute — the command never reaches git.
+gitfence operates before git hooks. If a command is blocked, no hooks
+execute — the command never reaches git.
 
 ## License
 
