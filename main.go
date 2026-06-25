@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/shahriarhossain/gitfence/internal/config"
 	"github.com/shahriarhossain/gitfence/internal/gateway"
@@ -82,7 +84,7 @@ func runGitfenceCommand(subcmd string, args []string) {
 	case "deactivate":
 		setup.Deactivate(args)
 	case "version":
-		fmt.Println("gitfence v0.1.1")
+		fmt.Println("gitfence v0.2.0")
 	case "check":
 		checkApproval(args)
 	}
@@ -147,6 +149,8 @@ func blockLocally(cmd parser.Command) {
 }
 
 func handleGatewayEvaluation(cfg *config.Config, cmd parser.Command, args []string) {
+	headSHA := gateway.CaptureHeadSHA()
+
 	resp, err := gateway.Evaluate(cfg, cmd, args)
 	if err != nil {
 		if cfg.OfflineMode == "fail-open" {
@@ -184,15 +188,109 @@ func handleGatewayEvaluation(cfg *config.Config, cmd parser.Command, args []stri
 		}
 		if resp.ApprovalID != "" {
 			fmt.Fprintf(os.Stderr, "\n  Approval ID: %s\n", resp.ApprovalID)
-			fmt.Fprintf(os.Stderr, "  Check status: gitfence check %s\n", resp.ApprovalID)
-			fmt.Fprintln(os.Stderr, "  Once approved, re-run your command.")
 		}
-		os.Exit(2)
+
+		if shouldWait(cfg) && resp.ApprovalID != "" {
+			fmt.Fprintf(os.Stderr, "  Waiting for approval... (Ctrl+C to exit)\n\n")
+			waitForApproval(cfg, resp.ApprovalID, headSHA, args)
+		} else {
+			if resp.ApprovalID != "" {
+				fmt.Fprintf(os.Stderr, "  Check status: gitfence check %s\n", resp.ApprovalID)
+				fmt.Fprintln(os.Stderr, "  Once approved, re-run your command.")
+			}
+			os.Exit(2)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "gitfence: unexpected gateway decision '%s'\n", resp.Decision)
 		os.Exit(1)
 	}
+}
+
+func shouldWait(cfg *config.Config) bool {
+	switch cfg.WaitMode {
+	case "on":
+		return true
+	case "off":
+		return false
+	default: // "auto"
+		return isTerminal()
+	}
+}
+
+func isTerminal() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func waitForApproval(cfg *config.Config, approvalID string, headSHA string, args []string) {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	pollInterval := time.Duration(cfg.WaitPollSeconds) * time.Second
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sigCh:
+			fmt.Fprintf(os.Stderr, "\n\ngitfence: interrupted\n")
+			fmt.Fprintf(os.Stderr, "  Resume with: gitfence check %s\n", approvalID)
+			fmt.Fprintf(os.Stderr, "  Once approved, re-run your command.\n")
+			os.Exit(2)
+
+		case <-ticker.C:
+			status, err := gateway.CheckApproval(cfg, approvalID)
+			if err != nil {
+				// Transient error — keep polling
+				continue
+			}
+
+			switch status.Status {
+			case "APPROVED":
+				executeAfterApproval(headSHA, args)
+				return
+			case "DENIED":
+				fmt.Fprintf(os.Stderr, "  Denied")
+				if status.Message != "" {
+					fmt.Fprintf(os.Stderr, ": %s", status.Message)
+				}
+				fmt.Fprintln(os.Stderr)
+				os.Exit(1)
+			case "TIMED_OUT":
+				fmt.Fprintln(os.Stderr, "  Timed out — no reviewer responded")
+				os.Exit(1)
+			}
+			// PENDING — keep polling
+		}
+	}
+}
+
+func executeAfterApproval(originalSHA string, args []string) {
+	if originalSHA != "" {
+		currentSHA := gateway.CaptureHeadSHA()
+		if currentSHA != "" && currentSHA != originalSHA {
+			fmt.Fprintln(os.Stderr, "  Approved, but working tree changed since approval was requested")
+			fmt.Fprintf(os.Stderr, "    Approved HEAD:  %s\n", truncSHA(originalSHA))
+			fmt.Fprintf(os.Stderr, "    Current HEAD:   %s\n", truncSHA(currentSHA))
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "  Re-run the command to submit a new approval request.")
+			os.Exit(1)
+		}
+	}
+	fmt.Fprintln(os.Stderr, "  Approved — executing command")
+	passThroughToGit(args)
+}
+
+func truncSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func passThroughToGit(args []string) {
@@ -216,7 +314,7 @@ func passThroughToGit(args []string) {
 }
 
 func findGit() (string, error) {
-	if envPath := os.Getenv("GITFENCE_GIT_PATH"); envPath != "" {
+	if envPath := config.GitPathFromEnv(); envPath != "" {
 		return envPath, nil
 	}
 

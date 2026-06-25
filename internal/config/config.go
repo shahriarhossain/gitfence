@@ -4,18 +4,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 type Config struct {
-	GatewayURL  string
-	AgentID     string
-	Token       string
-	OfflineMode string // "fail-closed" or "fail-open"
+	GatewayURL      string
+	AgentID         string
+	Token           string
+	OfflineMode     string // "fail-closed" or "fail-open"
+	WaitMode        string // "auto" (default), "on", or "off"
+	WaitPollSeconds int    // seconds between approval polls (default 10)
 }
 
 func (c *Config) HasGateway() bool {
 	return c.GatewayURL != "" && c.AgentID != "" && c.Token != ""
+}
+
+func GitPathFromEnv() string {
+	return os.Getenv("GITFENCE_GIT_PATH")
 }
 
 func ConfigDir() string {
@@ -31,7 +38,7 @@ func ConfigPath() string {
 }
 
 func Load() *Config {
-	cfg := &Config{OfflineMode: "fail-closed"}
+	cfg := &Config{OfflineMode: "fail-closed", WaitMode: "auto", WaitPollSeconds: 10}
 
 	path := ConfigPath()
 	data, err := os.ReadFile(path)
@@ -61,6 +68,12 @@ func Load() *Config {
 			cfg.Token = val
 		case "offline_mode":
 			cfg.OfflineMode = val
+		case "wait_mode":
+			cfg.WaitMode = val
+		case "wait_poll_seconds":
+			if n, err := strconv.Atoi(val); err == nil && n > 0 {
+				cfg.WaitPollSeconds = n
+			}
 		}
 	}
 
@@ -77,7 +90,9 @@ func Save(cfg *Config) error {
 agent_id = "%s"
 token = "%s"
 offline_mode = "%s"
-`, cfg.GatewayURL, cfg.AgentID, cfg.Token, cfg.OfflineMode)
+wait_mode = "%s"
+wait_poll_seconds = %d
+`, cfg.GatewayURL, cfg.AgentID, cfg.Token, cfg.OfflineMode, cfg.WaitMode, cfg.WaitPollSeconds)
 
 	path := ConfigPath()
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
